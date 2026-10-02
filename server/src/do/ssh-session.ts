@@ -1009,8 +1009,9 @@ export class SshSession extends DurableObject<Env> {
         exit_code: result.exitCode,
         stdout: result.stdout,
         stderr: result.stderr,
-        // Temporary diagnostics: channel messages seen during this exec.
-        exec_trace: this.agentSession?.getExecTrace() ?? [],
+        // False when the exec settled on its EOF fallback, meaning the server
+        // never reported a status and the code must not be trusted.
+        exit_code_verified: result.exitCodeVerified === true,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

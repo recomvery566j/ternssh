@@ -2,6 +2,12 @@ export interface ExecResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * False when the exec settled on its EOF fallback instead of a real
+   * exit-status from the server, in which case exitCode is only a placeholder.
+   * Absent on results produced before the agent API existed.
+   */
+  exitCodeVerified?: boolean;
 }
 
 export interface ServerStatusMetrics {
