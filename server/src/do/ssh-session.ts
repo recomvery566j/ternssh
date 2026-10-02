@@ -798,6 +798,8 @@ export class SshSession extends DurableObject<Env> {
         exit_code: result.exitCode,
         stdout: result.stdout,
         stderr: result.stderr,
+        // Temporary diagnostics: channel messages seen during this exec.
+        exec_trace: this.agentSession?.getExecTrace() ?? [],
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

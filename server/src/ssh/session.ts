@@ -61,6 +61,7 @@ interface PendingExec {
   resolve: (result: ExecResult) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  settleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
@@ -87,6 +88,8 @@ export class SSHSession {
   private shellChannel: SSHChannel;
   private nextChannelID: number = 1; // Start from 1, shellChannel uses 0
   private pendingExec: PendingExec | null = null;
+  // Diagnostics: channel-level messages seen during the most recent exec.
+  private execTrace: string[] = [];
   private execChain: Promise<void> = Promise.resolve();
   private readonly execOnly: boolean;
   private encryptCipher: SSHAESGCMCipher | SSHAESCTRCipher | null = null;
@@ -217,6 +220,7 @@ export class SSHSession {
     }
 
     return new Promise<ExecResult>((resolve, reject) => {
+      this.execTrace = [];
       const channelID = this.nextChannelID++;
       const channel = new SSHChannel();
       this.channels.set(channelID, channel);
@@ -235,6 +239,7 @@ export class SSHSession {
         resolve,
         reject,
         timer,
+        settleTimer: null,
       };
 
       void this.sendEncrypted(channel.buildOpenSession(channelID)).catch((error) => {
@@ -258,12 +263,39 @@ export class SSHSession {
     void this.completeExecAsync(exitCode);
   }
 
+  /**
+   * EOF/CLOSE can arrive before the server's exit-status request. Settling with
+   * the fallback code immediately would report every command as successful, so
+   * give the real exit code a short window to arrive first.
+   */
+  private scheduleExecFallback(exitCode: number, delayMs = 300): void {
+    const pending = this.pendingExec;
+    if (!pending || pending.finished || pending.settleTimer) return;
+
+    this.execTrace.push(`fallback scheduled in ${delayMs}ms`);
+    pending.settleTimer = setTimeout(() => {
+      if (this.pendingExec === pending && !pending.finished) {
+        this.finalizeExec(exitCode);
+      }
+    }, delayMs);
+  }
+
+  /** Channel-level messages seen during the most recent exec (diagnostics). */
+  getExecTrace(): string[] {
+    return this.execTrace.slice();
+  }
+
   private async completeExecAsync(exitCode: number): Promise<void> {
     const pending = this.pendingExec;
     if (!pending || pending.finished) return;
 
     pending.finished = true;
     clearTimeout(pending.timer);
+    if (pending.settleTimer) {
+      clearTimeout(pending.settleTimer);
+      pending.settleTimer = null;
+    }
+    this.execTrace.push(`settle exit=${exitCode}`);
     const channelID = pending.channelID;
     const result = {
       stdout: this.textDecoder.decode(this.concatChunks(pending.stdout)),
@@ -1342,8 +1374,9 @@ export class SSHSession {
           this.sendStatus('会话已结束');
           this.close(true);
         } else if (this.pendingExec && channelID === this.pendingExec.channelID) {
+          this.execTrace.push(`channel-eof ch=${channelID}`);
           if (!this.pendingExec.finished) {
-            this.finalizeExec(0);
+            this.scheduleExecFallback(0);
           }
         } else {
           // Other channel (SFTP etc.) EOF - don't close connection
@@ -1361,8 +1394,9 @@ export class SSHSession {
           this.sendStatus('会话已结束');
           this.close(true);
         } else if (this.pendingExec && channelID === this.pendingExec.channelID) {
+          this.execTrace.push(`channel-close ch=${channelID}`);
           if (!this.pendingExec.finished) {
-            this.finalizeExec(0);
+            this.scheduleExecFallback(0);
           } else {
             this.channels.delete(channelID);
           }
@@ -1388,14 +1422,26 @@ export class SSHSession {
         );
         offset += typeLen;
 
-        if (this.pendingExec && recipientChannel === this.pendingExec.channelID) {
-          if (requestType === 'exit-status') {
-            offset += 1;
-            const exitCode = readUint32(payload, offset);
+        const execTarget = this.pendingExec?.channelID ?? -1;
+        const matchesExec =
+          this.pendingExec !== null && recipientChannel === this.pendingExec.channelID;
+
+        if (requestType === 'exit-status') {
+          // Server sends: want_reply (1 byte), then exit_status (uint32).
+          const exitCode = readUint32(payload, offset + 1);
+          this.execTrace.push(
+            `exit-status ch=${recipientChannel} exec=+${execTarget} match=${matchesExec} code=${exitCode}`,
+          );
+          if (matchesExec) {
             this.finalizeExec(exitCode);
-          } else if (requestType === 'exit-signal') {
+          }
+        } else if (requestType === 'exit-signal') {
+          this.execTrace.push(`exit-signal ch=${recipientChannel} match=${matchesExec}`);
+          if (matchesExec) {
             this.finalizeExec(128);
           }
+        } else if (matchesExec) {
+          this.execTrace.push(`channel-request ch=${recipientChannel} type=${requestType}`);
         }
         break;
       }
