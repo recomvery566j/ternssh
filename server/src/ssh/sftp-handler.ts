@@ -972,4 +972,147 @@ export class SFTPHandler {
       modifiedTime: attrs.mtime || 0,
     };
   }
+
+  // ---------------------------------------------------------------------------
+  // Agent API: direct-result variants.
+  //
+  // The human UI path pushes results out through sendJSON/sendBinary, which is
+  // useless to a programmatic caller that needs a return value. These methods
+  // run the same SFTPClient operations but return the data. The UI methods
+  // above are deliberately untouched so the browser panel cannot regress.
+  // ---------------------------------------------------------------------------
+
+  /** List a directory, returning frontend-shaped entries. */
+  async listEntriesDirect(path: string): Promise<any[]> {
+    const resolved = await this.resolveRemotePath(path);
+
+    const openResp = await this.sftp.openDir(resolved);
+    if (openResp[0] === SSH_FXP_STATUS) {
+      throw new Error(this.sftp.parseStatusResponse(openResp).message);
+    }
+    if (openResp[0] !== SSH_FXP_HANDLE) {
+      throw new Error('打开目录失败');
+    }
+
+    const handle = this.sftp.parseHandleResponse(openResp);
+    try {
+      const entries = await this.sftp.listAllEntries(handle);
+      return entries
+        .filter((entry) => entry.filename !== '.' && entry.filename !== '..')
+        .map((entry) => this.formatEntry(entry));
+    } finally {
+      // Release the handle even when listing fails, otherwise the remote end
+      // leaks it for the life of the SSH connection.
+      await this.sftp.closeHandle(handle).catch(() => {});
+    }
+  }
+
+  /** Read a whole file. Throws when it exceeds maxBytes. */
+  async readFileDirect(path: string, maxBytes: number): Promise<Uint8Array> {
+    const resolved = await this.resolveRemotePath(path);
+
+    const statResp = await this.sftp.stat(resolved);
+    if (statResp[0] === SSH_FXP_STATUS) {
+      throw new Error(this.sftp.parseStatusResponse(statResp).message);
+    }
+
+    const attrs: SFTPFileAttributes =
+      statResp[0] === SSH_FXP_ATTRS ? this.sftp.parseAttrsResponse(statResp) : {};
+    const size = attrs.size ?? 0;
+    if (size > maxBytes) {
+      throw new Error('文件过大 (' + formatFileSize(size) + ')，最大支持 ' + formatFileSize(maxBytes));
+    }
+
+    const openResp = await this.sftp.openFile(resolved, SSH_FXF_READ);
+    if (openResp[0] === SSH_FXP_STATUS) {
+      throw new Error(this.sftp.parseStatusResponse(openResp).message);
+    }
+    if (openResp[0] !== SSH_FXP_HANDLE) {
+      throw new Error('打开文件失败');
+    }
+
+    const handle = this.sftp.parseHandleResponse(openResp);
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+
+    try {
+      for (;;) {
+        const resp = await this.sftp.readFile(handle, offset, DOWNLOAD_CHUNK_SIZE);
+        const type = resp[0];
+
+        if (type === SSH_FXP_STATUS) {
+          const status = this.sftp.parseStatusResponse(resp);
+          if (status.code === SSH_FX_EOF) break;
+          if (status.code !== SSH_FX_OK) throw new Error(status.message);
+          break;
+        }
+        if (type !== SSH_FXP_DATA) {
+          throw new Error('SFTP 读取响应异常');
+        }
+
+        const chunk = this.sftp.parseDataResponse(resp);
+        if (chunk.length === 0) break;
+
+        chunks.push(chunk);
+        offset += chunk.length;
+        if (offset >= maxBytes) break;
+      }
+    } finally {
+      await this.sftp.closeHandle(handle).catch(() => {});
+    }
+
+    const total = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let position = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, position);
+      position += chunk.length;
+    }
+    return out;
+  }
+
+  /** Write bytes to a file, creating or truncating it. Returns bytes written. */
+  async writeFileDirect(path: string, data: Uint8Array): Promise<number> {
+    const resolved = await this.resolveRemotePath(path);
+
+    const openResp = await this.sftp.openFile(
+      resolved,
+      SSH_FXF_WRITE | SSH_FXF_CREAT | SSH_FXF_TRUNC,
+    );
+    if (openResp[0] === SSH_FXP_STATUS) {
+      throw new Error(this.sftp.parseStatusResponse(openResp).message);
+    }
+    if (openResp[0] !== SSH_FXP_HANDLE) {
+      throw new Error('创建文件失败');
+    }
+
+    const handle = this.sftp.parseHandleResponse(openResp);
+    let offset = 0;
+
+    try {
+      while (offset < data.length) {
+        const pieceLength = Math.min(SFTP_WRITE_MAX, data.length - offset);
+        const resp = await this.sftp.writeFile(
+          handle,
+          offset,
+          data.subarray(offset, offset + pieceLength),
+        );
+
+        // A silently failed chunk would truncate the uploaded file, so every
+        // chunk's status is checked rather than assumed.
+        if (resp[0] === SSH_FXP_STATUS) {
+          const status = this.sftp.parseStatusResponse(resp);
+          if (status.code !== SSH_FX_OK) throw new Error(status.message);
+        } else {
+          throw new Error('SFTP 写入响应异常');
+        }
+
+        offset += pieceLength;
+      }
+    } finally {
+      await this.sftp.closeHandle(handle).catch(() => {});
+    }
+
+    return offset;
+  }
 }

@@ -19,8 +19,30 @@ import {
 import { connectToHost } from "../lib/resolve-host";
 import { SSHSession } from "../ssh/session";
 import type { SSHConnectionConfig } from "../ssh/types";
+import type { SFTPHandler } from "../ssh/sftp-handler";
 
 const DEFAULT_AGENT_TIMEOUT_MS = 15_000;
+const AGENT_SFTP_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_AGENT_FILE_BYTES = 4 * 1024 * 1024;
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 8_192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    // Chunked so a large file cannot blow the argument limit of apply().
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const binary = atob(value);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
 
 interface SessionRow {
   id: string;
@@ -79,6 +101,18 @@ export class SshSession extends DurableObject<Env> {
     // terminal WebSocket — the human UI paths below are left untouched.
     if (parsed.channel === "exec") {
       return this.handleExecRequest(request);
+    }
+
+    // ★ 2026-10-02: agent file transfer. Same deal as exec: independent of the
+    // terminal/SFTP-panel paths, which keep using their own session rows.
+    if (parsed.channel === "sftp-list") {
+      return this.handleSftpListRequest(request);
+    }
+    if (parsed.channel === "sftp-read") {
+      return this.handleSftpReadRequest(request);
+    }
+    if (parsed.channel === "sftp-write") {
+      return this.handleSftpWriteRequest(request);
     }
 
     const session = await this.env.DB.prepare(
@@ -720,6 +754,183 @@ export class SshSession extends DurableObject<Env> {
     this.bootstrapping = null;
   }
 
+  // ★ 2026-10-02: agent file transfer entry points (routes/agent.ts).
+  // Shares the lookup/credential plumbing with handleExecRequest so both APIs
+  // behave identically for callers.
+  private async prepareAgentSftpRequest(
+    request: Request,
+  ): Promise<
+    | {
+        config: SSHConnectionConfig;
+        path: string;
+        contentBase64: string | null;
+        maxBytes: number;
+      }
+    | Response
+  > {
+    let body: {
+      userId?: unknown;
+      serverId?: unknown;
+      path?: unknown;
+      contentBase64?: unknown;
+      maxBytes?: unknown;
+    };
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        { success: false, error: "invalid JSON body" },
+        { status: 400 },
+      );
+    }
+
+    const userId = typeof body.userId === "string" ? body.userId : "";
+    const serverId = typeof body.serverId === "string" ? body.serverId : "";
+    const path = typeof body.path === "string" ? body.path : "";
+
+    if (!userId || !serverId || !path) {
+      return Response.json(
+        { success: false, error: "userId, serverId and path are required" },
+        { status: 400 },
+      );
+    }
+
+    const serverRecord = await getServer(this.env.DB, userId, serverId);
+    if (!serverRecord) {
+      return Response.json(
+        { success: false, error: "server not found" },
+        { status: 404 },
+      );
+    }
+
+    const credential = await getCredentialValue(
+      this.env.DB,
+      userId,
+      serverRecord.credential_ref,
+    );
+    if (!credential) {
+      return Response.json(
+        { success: false, error: "credential not found" },
+        { status: 404 },
+      );
+    }
+
+    return {
+      config: buildSSHConnectionConfig(serverRecord, credential),
+      path,
+      contentBase64:
+        typeof body.contentBase64 === "string" ? body.contentBase64 : null,
+      maxBytes:
+        typeof body.maxBytes === "number" && Number.isFinite(body.maxBytes)
+          ? Math.trunc(body.maxBytes)
+          : DEFAULT_MAX_AGENT_FILE_BYTES,
+    };
+  }
+
+  /**
+   * Run one operation against the agent SFTP channel.
+   *
+   * A failure drops the channel so the next call rebuilds it: SFTP handles and
+   * the remote subsystem do not survive a protocol-level error, and leaving a
+   * half-dead channel in place turns one visible failure into a later mystery.
+   */
+  private async runAgentSftp<T>(
+    config: SSHConnectionConfig,
+    operation: (handler: SFTPHandler) => Promise<T>,
+  ): Promise<T> {
+    await this.ensureAgentSession(config);
+    if (!this.agentSession?.isSSHReady()) {
+      throw new Error("SSH 连接未就绪");
+    }
+
+    const session = this.agentSession;
+    const handler = await session.ensureAgentSftp(AGENT_SFTP_TIMEOUT_MS);
+
+    try {
+      return await operation(handler);
+    } catch (error) {
+      session.closeAgentSftp();
+      throw error;
+    }
+  }
+
+  private agentSftpFailure(error: unknown): Response {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = message.includes("超时") ? 504 : 502;
+    return Response.json({ success: false, error: message }, { status });
+  }
+
+  // POST https://ssh-session.internal/agent/sftp/list
+  private async handleSftpListRequest(request: Request): Promise<Response> {
+    const prepared = await this.prepareAgentSftpRequest(request);
+    if (prepared instanceof Response) return prepared;
+
+    try {
+      const entries = await this.runAgentSftp(prepared.config, (handler) =>
+        handler.listEntriesDirect(prepared.path),
+      );
+      return Response.json({ success: true, path: prepared.path, entries });
+    } catch (error) {
+      return this.agentSftpFailure(error);
+    }
+  }
+
+  // POST https://ssh-session.internal/agent/sftp/read
+  private async handleSftpReadRequest(request: Request): Promise<Response> {
+    const prepared = await this.prepareAgentSftpRequest(request);
+    if (prepared instanceof Response) return prepared;
+
+    try {
+      const bytes = await this.runAgentSftp(prepared.config, (handler) =>
+        handler.readFileDirect(prepared.path, prepared.maxBytes),
+      );
+      return Response.json({
+        success: true,
+        path: prepared.path,
+        size: bytes.length,
+        contentBase64: bytesToBase64(bytes),
+      });
+    } catch (error) {
+      return this.agentSftpFailure(error);
+    }
+  }
+
+  // POST https://ssh-session.internal/agent/sftp/write
+  private async handleSftpWriteRequest(request: Request): Promise<Response> {
+    const prepared = await this.prepareAgentSftpRequest(request);
+    if (prepared instanceof Response) return prepared;
+
+    if (prepared.contentBase64 === null) {
+      return Response.json(
+        { success: false, error: "contentBase64 is required" },
+        { status: 400 },
+      );
+    }
+
+    let data: Uint8Array;
+    try {
+      data = base64ToBytes(prepared.contentBase64);
+    } catch {
+      return Response.json(
+        { success: false, error: "contentBase64 is not valid base64" },
+        { status: 400 },
+      );
+    }
+
+    try {
+      const written = await this.runAgentSftp(prepared.config, (handler) =>
+        handler.writeFileDirect(prepared.path, data),
+      );
+      return Response.json({
+        success: true,
+        path: prepared.path,
+        bytes_written: written,
+      });
+    } catch (error) {
+      return this.agentSftpFailure(error);
+    }
+  }
+
   // ★ 2026-10-02: agent API entry point. Deliberately independent from the
   // terminal/status paths: no session row, no terminal WebSocket, and its own
   // exec-only SSH connection (execOnly=true -> no PTY, no xterm ANSI traffic).
@@ -912,10 +1123,29 @@ export class SshSession extends DurableObject<Env> {
 
 function parseRequestUrl(
   url: string,
-): { sessionId: string; channel: "terminal" | "sftp" | "status" | "exec" } | null {
+): {
+  sessionId: string;
+  channel:
+    | "terminal"
+    | "sftp"
+    | "status"
+    | "exec"
+    | "sftp-list"
+    | "sftp-read"
+    | "sftp-write";
+} | null {
   const pathname = new URL(url).pathname;
   if (pathname === "/agent/exec") {
     return { sessionId: "", channel: "exec" };
+  }
+  if (pathname === "/agent/sftp/list") {
+    return { sessionId: "", channel: "sftp-list" };
+  }
+  if (pathname === "/agent/sftp/read") {
+    return { sessionId: "", channel: "sftp-read" };
+  }
+  if (pathname === "/agent/sftp/write") {
+    return { sessionId: "", channel: "sftp-write" };
   }
   const statusMatch = pathname.match(/\/sessions\/([^/]+)\/status$/);
   if (statusMatch?.[1]) {

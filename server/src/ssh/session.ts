@@ -1641,6 +1641,66 @@ export class SSHSession {
     this.sendDebug(`SFTP channel open requested, channelID=${channelID}, channels count=${this.channels.size}`);
   }
 
+  /**
+   * Sink WebSocket used as the sftpConnections key for the agent path.
+   *
+   * Reusing the existing SFTP plumbing gives the agent the working channel
+   * handshake and CHANNEL_DATA routing for free, but that plumbing pushes UI
+   * notifications at a WebSocket. Agent results come back through direct
+   * method calls instead, so anything sent here is discarded on purpose.
+   */
+  private agentSftpSink: WebSocket | null = null;
+
+  /** Return a ready SFTP handler for the agent path, opening one if needed. */
+  async ensureAgentSftp(timeoutMs: number): Promise<SFTPHandler> {
+    if (!this.isSSHReady()) {
+      throw new Error('SSH 连接未就绪');
+    }
+
+    if (!this.agentSftpSink) {
+      this.agentSftpSink = {
+        readyState: 1,
+        send: () => {},
+        close: () => {},
+      } as unknown as WebSocket;
+    }
+
+    const existing = this.getOrCreateSftpState(this.agentSftpSink);
+    if (existing.handler?.isReady()) {
+      return existing.handler;
+    }
+
+    await this.openSFTPChannel(this.agentSftpSink);
+
+    // The handler flips to ready once the subsystem handshake completes but
+    // exposes no callback for it, so poll briefly rather than guess a delay.
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const state = this.getOrCreateSftpState(this.agentSftpSink);
+      if (state.handler?.isReady()) {
+        return state.handler;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    this.closeAgentSftp();
+    throw new Error('SFTP 会话建立超时');
+  }
+
+  /** Drop the agent SFTP channel; a later call opens a fresh one. */
+  closeAgentSftp(): void {
+    if (!this.agentSftpSink) return;
+
+    const sink = this.agentSftpSink;
+    this.agentSftpSink = null;
+    try {
+      this.closeSFTPChannel(sink);
+    } catch {
+      // Best-effort: this can also run while the SSH connection tears down.
+    }
+    this.sftpConnections.delete(sink);
+  }
+
   private enqueueSFTPTask(
     ws: WebSocket,
     operation: string,
