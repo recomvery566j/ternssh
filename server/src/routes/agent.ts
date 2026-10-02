@@ -192,7 +192,9 @@ agentRoutes.post("/sftp/read", async (c) => {
   const target = await resolveSftpTarget(c, body.node_id, body.path);
   if (target instanceof Response) return target;
 
-  return target.stub.fetch(
+  const encoding = parseEncoding(body.encoding);
+
+  const doResponse = await target.stub.fetch(
     new Request("https://ssh-session.internal/agent/sftp/read", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -200,11 +202,41 @@ agentRoutes.post("/sftp/read", async (c) => {
         userId: target.userId,
         serverId: target.serverId,
         path: target.path,
-        encoding: parseEncoding(body.encoding),
+        encoding,
         maxBytes: parseMaxBytes(body.max_bytes),
       }),
     }),
   );
+
+  // The DO always hands back base64. Converting it into the shape the caller
+  // asked for has to happen here, or utf8 callers receive a base64 blob while
+  // looking for a "content" field that does not exist.
+  let payload: any;
+  try {
+    payload = await doResponse.json();
+  } catch {
+    return jsonError(c, 502, "invalid response from session");
+  }
+
+  if (!payload || payload.success !== true) {
+    return Response.json(
+      payload ?? { success: false, error: "read failed" },
+      { status: doResponse.status },
+    );
+  }
+
+  const contentBase64 =
+    typeof payload.contentBase64 === "string" ? payload.contentBase64 : "";
+  const bytes = contentBase64 ? base64ToBytes(contentBase64) : new Uint8Array(0);
+
+  return Response.json({
+    success: true,
+    path: payload.path,
+    size: typeof payload.size === "number" ? payload.size : bytes.length,
+    content: encoding === "base64"
+      ? contentBase64
+      : new TextDecoder().decode(bytes),
+  });
 });
 
 // POST /api/v1/agent/sftp/write  { node_id, path, content, encoding? }
