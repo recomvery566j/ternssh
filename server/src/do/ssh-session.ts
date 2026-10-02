@@ -14,10 +14,13 @@ import {
   MAX_STATUS_POLL_INTERVAL_MS,
   parseProcessLimitParam,
   parseStatusOutput,
+  type ExecResult,
 } from "../lib/server-status";
 import { connectToHost } from "../lib/resolve-host";
 import { SSHSession } from "../ssh/session";
 import type { SSHConnectionConfig } from "../ssh/types";
+
+const DEFAULT_AGENT_TIMEOUT_MS = 15_000;
 
 interface SessionRow {
   id: string;
@@ -61,11 +64,21 @@ export class SshSession extends DurableObject<Env> {
   > | null = null;
   private statusCollectChain: Promise<void> = Promise.resolve();
   private statusPushInFlight: Promise<void> | null = null;
+  private agentSession: SSHSession | null = null;
+  private agentBootstrapping: Promise<void> | null = null;
+  private agentConfig: SSHConnectionConfig | null = null;
+  private agentExecChain: Promise<void> = Promise.resolve();
 
   async fetch(request: Request): Promise<Response> {
     const parsed = parseRequestUrl(request.url);
     if (!parsed) {
       return new Response("Invalid session URL", { status: 400 });
+    }
+
+    // ★ 2026-10-02: agent exec channel (routes/agent.ts). No sessions row and no
+    // terminal WebSocket — the human UI paths below are left untouched.
+    if (parsed.channel === "exec") {
+      return this.handleExecRequest(request);
     }
 
     const session = await this.env.DB.prepare(
@@ -706,12 +719,202 @@ export class SshSession extends DurableObject<Env> {
     await this.bootstrapping;
     this.bootstrapping = null;
   }
+
+  // ★ 2026-10-02: agent API entry point. Deliberately independent from the
+  // terminal/status paths: no session row, no terminal WebSocket, and its own
+  // exec-only SSH connection (execOnly=true -> no PTY, no xterm ANSI traffic).
+  private async handleExecRequest(request: Request): Promise<Response> {
+    let body: {
+      userId?: unknown;
+      serverId?: unknown;
+      command?: unknown;
+      timeoutMs?: unknown;
+    };
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        { success: false, error: "invalid JSON body" },
+        { status: 400 },
+      );
+    }
+
+    const userId = typeof body.userId === "string" ? body.userId : "";
+    const serverId = typeof body.serverId === "string" ? body.serverId : "";
+    const command = typeof body.command === "string" ? body.command : "";
+    const timeoutMs =
+      typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs)
+        ? body.timeoutMs
+        : DEFAULT_AGENT_TIMEOUT_MS;
+
+    if (!userId || !serverId || !command) {
+      return Response.json(
+        { success: false, error: "userId, serverId and command are required" },
+        { status: 400 },
+      );
+    }
+
+    const serverRecord = await getServer(this.env.DB, userId, serverId);
+    if (!serverRecord) {
+      return Response.json(
+        { success: false, error: "server not found" },
+        { status: 404 },
+      );
+    }
+
+    const credential = await getCredentialValue(
+      this.env.DB,
+      userId,
+      serverRecord.credential_ref,
+    );
+    if (!credential) {
+      return Response.json(
+        { success: false, error: "credential not found" },
+        { status: 404 },
+      );
+    }
+
+    const config = buildSSHConnectionConfig(serverRecord, credential);
+
+    try {
+      let result: ExecResult;
+      try {
+        result = await this.runAgentExec(config, command, timeoutMs);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!this.isRetriableAgentError(message)) {
+          throw error;
+        }
+
+        // Stale connection: reconnect once and retry. Only errors that prove the
+        // command never reached the remote shell are listed as retriable — see
+        // isRetriableAgentError().
+        this.closeAgentSession();
+        result = await this.runAgentExec(config, command, timeoutMs);
+      }
+
+      return Response.json({
+        success: true,
+        exit_code: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const status = message.includes("命令执行超时") ? 504 : 502;
+      return Response.json(
+        {
+          success: false,
+          exit_code: null,
+          stdout: "",
+          stderr: "",
+          error: message,
+        },
+        { status },
+      );
+    }
+  }
+
+  // Retrying must never run a command twice. "命令执行超时" and "已有命令正在
+  // 执行" are therefore NOT retriable here (unlike the status-collection path,
+  // where every command is an idempotent read).
+  private isRetriableAgentError(message: string): boolean {
+    return (
+      message.includes("open failed") ||
+      message.includes("Exec 通道打开失败") ||
+      message.includes("Exec 请求被拒绝") ||
+      message.includes("SSH 连接未就绪")
+    );
+  }
+
+  private async runAgentExec(
+    config: SSHConnectionConfig,
+    command: string,
+    timeoutMs: number,
+  ): Promise<ExecResult> {
+    await this.ensureAgentSession(config);
+    if (!this.agentSession?.isSSHReady()) {
+      throw new Error("SSH 连接未就绪");
+    }
+
+    const session = this.agentSession;
+    const result = this.agentExecChain.then(() =>
+      session.execCommand(command, timeoutMs),
+    );
+    this.agentExecChain = result.then(
+      () => {},
+      () => {},
+    );
+    return result;
+  }
+
+  private closeAgentSession(): void {
+    this.agentSession?.close();
+    this.agentSession = null;
+    this.agentBootstrapping = null;
+    this.agentConfig = null;
+  }
+
+  private async ensureAgentSession(config: SSHConnectionConfig): Promise<void> {
+    if (this.agentSession?.isSSHReady()) return;
+
+    if (this.agentBootstrapping) {
+      await this.agentBootstrapping;
+      await this.waitForAgentReady(30_000);
+      return;
+    }
+
+    this.closeAgentSession();
+
+    this.agentBootstrapping = (async () => {
+      const socket = await connectToHost(config.host, config.port);
+
+      const noopWs = {
+        send: () => {},
+        close: () => {},
+      } as unknown as WebSocket;
+
+      const session = new SSHSession(
+        noopWs,
+        socket,
+        config,
+        false,
+        false,
+        undefined,
+        true,
+      );
+      this.agentConfig = config;
+      this.agentSession = session;
+      await session.startHandshake();
+      await this.waitForAgentReady(30_000);
+    })();
+
+    try {
+      await this.agentBootstrapping;
+    } finally {
+      this.agentBootstrapping = null;
+    }
+  }
+
+  private async waitForAgentReady(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (this.agentSession?.isSSHReady()) return;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+
+    throw new Error("SSH 连接未就绪");
+  }
 }
 
 function parseRequestUrl(
   url: string,
-): { sessionId: string; channel: "terminal" | "sftp" | "status" } | null {
+): { sessionId: string; channel: "terminal" | "sftp" | "status" | "exec" } | null {
   const pathname = new URL(url).pathname;
+  if (pathname === "/agent/exec") {
+    return { sessionId: "", channel: "exec" };
+  }
   const statusMatch = pathname.match(/\/sessions\/([^/]+)\/status$/);
   if (statusMatch?.[1]) {
     return { sessionId: statusMatch[1], channel: "status" };
